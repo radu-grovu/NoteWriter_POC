@@ -1,0 +1,9 @@
+﻿.venv/
+__pycache__/
+*.pyc
+out/
+inbox/
+_ocr_debug/
+.ipynb_checkpoints/
+.DS_Store
+.env
