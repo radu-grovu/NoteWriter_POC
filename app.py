@@ -13,6 +13,17 @@ st.set_page_config(page_title="NoteWriter – Text-Only (MyStyle)", layout="wide
 st.title("NoteWriter – Text-Only (MyStyle)")
 st.caption("Paste labeled clinical text → get HPI, A&P, Physical Exam, and Med Review")
 
+# Predefined friendly model list (you can edit this)
+FRIENDLY_MODELS = [
+    ("ChatGPT-5 (recommended)", "gpt-5"),
+    ("ChatGPT-5 Pro (bigger, pricier)", "gpt-5-pro"),
+    ("ChatGPT-5 Mini (fast/cheap)", "gpt-5-mini"),
+    ("GPT-4.1", "gpt-4.1"),
+]
+
+FRIENDLY_MODEL_NAMES = [name for name, _id in FRIENDLY_MODELS]
+MODEL_NAME_TO_ID = {name: mid for name, mid in FRIENDLY_MODELS}
+
 # -----------------------
 # SIDEBAR: SETTINGS & FORMATS
 # -----------------------
@@ -20,8 +31,35 @@ with st.sidebar:
     st.header("Settings")
     st.write("Add your API key in Streamlit **Secrets** as `OPENAI_API_KEY`.")
 
-    default_model = "gpt-4.1"
-    model = st.text_input("Model", value=default_model)
+    # --- Model selection (dropdown) ---
+    st.subheader("Model")
+    chosen_friendly = st.selectbox(
+        "Select a model",
+        FRIENDLY_MODEL_NAMES,
+        index=0,
+        help="Pick a ChatGPT model for generation."
+    )
+    model = MODEL_NAME_TO_ID[chosen_friendly]
+
+    # Optional: allow a custom override (for advanced users)
+    with st.expander("Advanced model options"):
+        custom_model = st.text_input(
+            "Custom model ID (optional)",
+            value="",
+            help="If provided, this overrides the dropdown choice."
+        )
+        use_fallback = st.checkbox("Enable fallback model", value=False)
+        fallback_friendly = st.selectbox(
+            "Fallback model",
+            FRIENDLY_MODEL_NAMES,
+            index=3,  # default to GPT-4.1
+            disabled=not use_fallback
+        )
+        fallback_model = MODEL_NAME_TO_ID[fallback_friendly] if use_fallback else None
+
+    if custom_model.strip():
+        model = custom_model.strip()
+
     max_tokens = st.slider("Max output tokens", 300, 4000, 1600, 50)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
 
@@ -69,16 +107,14 @@ with st.sidebar:
     )
     free_instr = st.text_area(
         "Free Text instructions",
-        value=(
-            "Use as supplemental context; do not override objective data unless justified."
-        ),
+        value="Use as supplemental context; do not override objective data unless justified.",
         height=120
     )
 
     st.divider()
     st.subheader("Output Style Controls")
 
-    # NEW: HPI and Physical Exam (HP) style editors
+    # HPI and Physical Exam (HP) style editors
     hpi_style = st.text_area(
         "HPI Style",
         value=(
@@ -97,7 +133,7 @@ with st.sidebar:
         height=140
     )
 
-    # Existing A&P style editor
+    # Assessment & Plan style editor
     ap_style = st.text_area(
         "Assessment & Plan Style",
         value=(
@@ -210,9 +246,32 @@ def assemble_prompt() -> str:
 # -----------------------
 # MODEL CALL
 # -----------------------
-def call_model(user_payload: str, model: str, max_tokens: int, temperature: float):
+def _try_responses_api(client: OpenAI, user_payload: str, model_id: str, max_tokens: int, temperature: float):
+    resp = client.responses.create(
+        model=model_id,
+        input=[{"role": "user", "content": [{"type": "text", "text": user_payload}]}],
+        max_output_tokens=max_tokens,
+        temperature=temperature,
+    )
+    # Newer SDKs expose this convenience:
+    text = getattr(resp, "output_text", None)
+    if not text:
+        if hasattr(resp, "output") and len(resp.output) > 0 and "content" in resp.output[0]:
+            text = resp.output[0]["content"][0].get("text", "")
+    return text
+
+def _try_chat_completions(client: OpenAI, user_payload: str, model_id: str, max_tokens: int, temperature: float):
+    chat = client.chat.completions.create(
+        model=model_id,
+        messages=[{"role": "user", "content": user_payload}],
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return chat.choices[0].message.content
+
+def call_model_with_optional_fallback(user_payload: str, primary_model: str, fallback_model: str | None, max_tokens: int, temperature: float):
     """
-    Try OpenAI Responses API first; if unavailable in the environment, fall back to Chat Completions.
+    Try primary via Responses API -> Chat Completions; if any path fails and fallback is set, try fallback.
     """
     api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -221,45 +280,51 @@ def call_model(user_payload: str, model: str, max_tokens: int, temperature: floa
 
     client = OpenAI(api_key=api_key)
 
-    # Preferred path: Responses API (modern SDK)
+    # Primary attempts
     try:
-        resp = client.responses.create(
-            model=model,
-            input=[{"role": "user", "content": [{"type": "text", "text": user_payload}]}],
-            max_output_tokens=max_tokens,
-            temperature=temperature,
-        )
-        # Newer SDKs expose this convenience:
-        text = getattr(resp, "output_text", None)
-        if not text:
-            # Fallback extraction if output_text isn't available
-            if hasattr(resp, "output") and len(resp.output) > 0 and "content" in resp.output[0]:
-                text = resp.output[0]["content"][0].get("text", "")
+        text = _try_responses_api(client, user_payload, primary_model, max_tokens, temperature)
+        if text:
+            return text
+    except Exception:
+        pass
+    try:
+        text = _try_chat_completions(client, user_payload, primary_model, max_tokens, temperature)
         if text:
             return text
     except Exception:
         pass
 
-    # Fallback path: Chat Completions
-    try:
-        chat = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": user_payload}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        return chat.choices[0].message.content
-    except Exception as e:
-        st.error(f"Model error: {e}")
-        return None
+    # Fallback attempts
+    if fallback_model:
+        try:
+            text = _try_responses_api(client, user_payload, fallback_model, max_tokens, temperature)
+            if text:
+                return text
+        except Exception:
+            pass
+        try:
+            text = _try_chat_completions(client, user_payload, fallback_model, max_tokens, temperature)
+            if text:
+                return text
+        except Exception:
+            pass
+
+    st.error("Model call failed for both primary and fallback (if set).")
+    return None
 
 # -----------------------
 # RUN BUTTON
 # -----------------------
 if st.button("Generate Note", type="primary"):
     payload = assemble_prompt()
-    with st.spinner("Generating…"):
-        raw = call_model(payload, model=model, max_tokens=max_tokens, temperature=temperature)
+    with st.spinner(f"Generating with {model}…"):
+        raw = call_model_with_optional_fallback(
+            user_payload=payload,
+            primary_model=model,
+            fallback_model=fallback_model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
 
     if not raw:
         st.error("No output received.")
