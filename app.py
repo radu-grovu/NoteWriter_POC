@@ -114,7 +114,7 @@ with st.sidebar:
     if fallback_model == "None":
         fallback_model = None
 
-    max_tokens = st.slider("Max output tokens", 300, 4000, 1800, 50)
+    max_tokens = st.slider("Max output tokens", 500, 8000, 8000, 100)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
 
     st.divider()
