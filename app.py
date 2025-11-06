@@ -5,33 +5,54 @@ import streamlit as st
 from datetime import date, timedelta
 from openai import OpenAI
 
-# -----------------------
-# Utility
-# -----------------------
+# =========================
+# Utilities (session-safe)
+# =========================
 def get_text_area(key: str, label: str, default: str, **kwargs):
-    """Persistent text area stored in session_state."""
+    """Persistent text area stored in session_state (for sidebar settings)."""
     if key not in st.session_state:
         st.session_state[key] = default
     return st.text_area(label, value=st.session_state[key], key=key, **kwargs)
 
-# -----------------------
+def get_input_area(key: str, label: str, **kwargs):
+    """Persistent text area for main inputs (ED, Labs, etc.)."""
+    if key not in st.session_state:
+        st.session_state[key] = ""
+    return st.text_area(label, value=st.session_state[key], key=key, **kwargs)
+
+def set_input_from_testcase(tc: dict):
+    """Populate all main inputs from a loaded test case dict."""
+    # Accept either titled keys or snake_case
+    def pull(d, *names):
+        for n in names:
+            if n in d and isinstance(d[n], str):
+                return d[n]
+        return ""
+    st.session_state["ed_note_input"]         = pull(tc, "ED Note", "ed_note")
+    st.session_state["prior_discharge_input"] = pull(tc, "Prior Discharge", "prior_discharge")
+    st.session_state["labs_input"]            = pull(tc, "Labs", "labs")
+    st.session_state["imaging_input"]         = pull(tc, "Imaging", "imaging", "imaging_impressions")
+    st.session_state["med_list_input"]        = pull(tc, "Med List", "Medication List", "med_list", "meds")
+    st.session_state["free_text_input"]       = pull(tc, "Free Text", "free_text", "other")
+
+# =========================
 # Page setup
-# -----------------------
-st.set_page_config(page_title="NoteWriter – MyStyle", layout="wide")
+# =========================
+st.set_page_config(page_title="NoteWriter – MyStyle (Test Case Mode)", layout="wide")
 st.title("NoteWriter – Text-Only (MyStyle)")
-st.caption("Paste clinical text → generate structured hospitalist note output")
+st.caption("Upload a test case → tune prompts in the sidebar → re-run instantly to evaluate output")
 
 today = date.today()
-cutoff = today - timedelta(days=183)
+cutoff = today - timedelta(days=183)  # ~6 months
 
-# -----------------------
+# =========================
 # Sidebar
-# -----------------------
+# =========================
 with st.sidebar:
     st.header("Settings")
-
     st.write("Add your OpenAI API key in Streamlit **Secrets** as `OPENAI_API_KEY`.")
 
+    # Model selection (safe default = gpt-4.1)
     model = st.selectbox("Model", ["gpt-4.1", "gpt-5", "gpt-5-pro", "gpt-5-mini"], index=0)
     fallback_model = st.selectbox("Fallback model", ["None", "gpt-4.1", "gpt-5"], index=1)
     if fallback_model == "None":
@@ -39,6 +60,42 @@ with st.sidebar:
 
     max_tokens = st.slider("Max output tokens", 300, 4000, 1800, 50)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
+
+    st.divider()
+    st.subheader("Test Case")
+    # Load a test case JSON (before main inputs are created)
+    uploaded_tc = st.file_uploader("Load test case (.json)", type=["json"], key="testcase_uploader")
+    if uploaded_tc is not None:
+        try:
+            tc_data = json.loads(uploaded_tc.getvalue().decode("utf-8"))
+            set_input_from_testcase(tc_data)
+            st.success("Test case loaded into inputs.")
+        except Exception as e:
+            st.error(f"Failed to load test case: {e}")
+
+    # Download current inputs as a test case
+    if st.button("📥 Download current inputs as test_case.json"):
+        current_tc = {
+            "ED Note":          st.session_state.get("ed_note_input", ""),
+            "Prior Discharge":  st.session_state.get("prior_discharge_input", ""),
+            "Labs":             st.session_state.get("labs_input", ""),
+            "Imaging":          st.session_state.get("imaging_input", ""),
+            "Med List":         st.session_state.get("med_list_input", ""),
+            "Free Text":        st.session_state.get("free_text_input", ""),
+        }
+        st.download_button(
+            "Save test_case.json",
+            data=json.dumps(current_tc, indent=2, ensure_ascii=False),
+            file_name="test_case.json",
+            mime="application/json",
+            use_container_width=True
+        )
+
+    # Quick reset of inputs
+    if st.button("🧹 Clear all inputs"):
+        for k in ["ed_note_input","prior_discharge_input","labs_input","imaging_input","med_list_input","free_text_input"]:
+            st.session_state[k] = ""
+        st.success("Inputs cleared.")
 
     st.divider()
     st.subheader("Per-Section Instructions")
@@ -49,35 +106,30 @@ with st.sidebar:
         "Identify presenting complaint, acute timeline, and new findings differing from baseline.",
         height=120,
     )
-
     disc_instr = get_text_area(
         "disc_instr",
         "Prior Discharge instructions",
         "Summarize durable diagnoses, baseline functional status, long-term meds. Exclude resolved inpatient-only issues.",
         height=120,
     )
-
     labs_instr = get_text_area(
         "labs_instr",
         "Labs instructions",
         "List only significant or trending abnormal results, e.g., 'WBC 15.4 ↑, ESR 93 ↑, CRP 47 ↑'.",
         height=120,
     )
-
     img_instr = get_text_area(
         "img_instr",
         "Imaging instructions",
         "Highlight new or worsening findings relevant to current complaint.",
         height=120,
     )
-
     meds_instr = get_text_area(
         "meds_instr",
         "Med List instructions",
         "List home/inpatient meds with dose and status. Mark held meds with '– Holding' and reason.",
         height=120,
     )
-
     free_instr = get_text_area(
         "free_instr",
         "Free Text instructions",
@@ -96,7 +148,6 @@ with st.sidebar:
         "Then describe acute presentation, differences from baseline, functional status, and social context.",
         height=200,
     )
-
     hp_style = get_text_area(
         "hp_style",
         "Physical Exam (HP) Style",
@@ -104,7 +155,6 @@ with st.sidebar:
         "Keep concise, emphasize abnormal findings.",
         height=120,
     )
-
     ap_style = get_text_area(
         "ap_style",
         "Assessment & Plan Style",
@@ -117,25 +167,25 @@ with st.sidebar:
         height=250,
     )
 
-# -----------------------
-# Inputs
-# -----------------------
-st.subheader("Paste Inputs")
+# =========================
+# Main Inputs (persisted)
+# =========================
+st.subheader("Paste Inputs (or load a Test Case in the sidebar)")
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    ed_note = st.text_area("ED Note", height=200)
-    prior_discharge = st.text_area("Prior Discharge Note", height=200)
+    ed_note = get_input_area("ed_note_input", "ED Note", height=200)
+    prior_discharge = get_input_area("prior_discharge_input", "Prior Discharge Note", height=200)
 with c2:
-    labs = st.text_area("Labs", height=200)
-    imaging = st.text_area("Imaging Impressions", height=200)
+    labs = get_input_area("labs_input", "Labs", height=200)
+    imaging = get_input_area("imaging_input", "Imaging Impressions", height=200)
 with c3:
-    med_list = st.text_area("Medication List", height=200)
-    free_text = st.text_area("Free Text / Other", height=200)
+    med_list = get_input_area("med_list_input", "Medication List", height=200)
+    free_text = get_input_area("free_text_input", "Free Text / Other", height=200)
 
-# -----------------------
+# =========================
 # Prompt construction
-# -----------------------
+# =========================
 def build_prompt():
     instruction = f"""
 You are a clinical note assistant producing output in JSON only.
@@ -193,9 +243,9 @@ Per-section instructions:
     inputs_json = json.dumps([i for i in inputs if i["text"].strip()], ensure_ascii=False)
     return f"{instruction}\n\nINPUTS_JSON:\n{inputs_json}\n\nReturn only JSON."
 
-# -----------------------
+# =========================
 # Model call
-# -----------------------
+# =========================
 def call_model(prompt, model, fallback, max_tokens, temperature):
     api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -203,7 +253,7 @@ def call_model(prompt, model, fallback, max_tokens, temperature):
         return None
     client = OpenAI(api_key=api_key)
 
-    # Try responses API
+    # Try Responses API first
     try:
         resp = client.responses.create(
             model=model,
@@ -216,7 +266,7 @@ def call_model(prompt, model, fallback, max_tokens, temperature):
     except Exception:
         pass
 
-    # Fallback chat
+    # Fallback to Chat Completions if configured
     if fallback:
         try:
             chat = client.chat.completions.create(
@@ -230,17 +280,23 @@ def call_model(prompt, model, fallback, max_tokens, temperature):
             st.error(f"Model error: {e}")
     return None
 
-# -----------------------
+# =========================
 # Run
-# -----------------------
+# =========================
 if st.button("Generate Note", type="primary"):
     with st.spinner(f"Generating with {model}..."):
         result = call_model(build_prompt(), model, fallback_model, max_tokens, temperature)
+
     if not result:
         st.error("No output received.")
     else:
+        # Attempt to parse JSON (and tolerate code fences)
         try:
-            cleaned = result.strip().strip("`").replace("json", "")
+            cleaned = result.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`")
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[len("json"):].strip()
             parsed = json.loads(cleaned)
         except Exception:
             parsed = None
@@ -250,16 +306,43 @@ if st.button("Generate Note", type="primary"):
             st.code(result)
         else:
             tabs = st.tabs(["HPI", "A&P", "Physical Exam", "Medication Review", "Source Summary"])
-            tab_names = ["hpi", "assessment_plan", "physical_exam", "medication_review", "source_summary"]
-            for tab, key in zip(tabs, tab_names):
+            keys = ["hpi", "assessment_plan", "physical_exam", "medication_review", "source_summary"]
+            for tab, key in zip(tabs, keys):
                 with tab:
-                    content = parsed[key]
-                    if isinstance(content, dict):
-                        st.json(content)
+                    content = parsed.get(key, "")
+                    if key == "medication_review" and isinstance(content, dict):
+                        # Render structured medication review
+                        st.subheader("Included Medications")
+                        inc = content.get("included_medications", [])
+                        if inc:
+                            for m in inc:
+                                st.markdown(f"- {json.dumps(m, ensure_ascii=False)}")
+                        else:
+                            st.markdown("_None_")
+                        st.subheader("Excluded Medications")
+                        exc = content.get("excluded_medications", [])
+                        if exc:
+                            for m in exc:
+                                st.markdown(f"- {json.dumps(m, ensure_ascii=False)}")
+                        else:
+                            st.markdown("_None_")
+                        st.subheader("Redundancies")
+                        for i in content.get("redundancies", []) or ["_None_"]:
+                            st.markdown(f"- {i}")
+                        st.subheader("Interactions")
+                        for i in content.get("interactions", []) or ["_None_"]:
+                            st.markdown(f"- {i}")
+                        st.subheader("Side Effects Relevant")
+                        for i in content.get("side_effects_relevant", []) or ["_None_"]:
+                            st.markdown(f"- {i}")
+                        st.subheader("Summary")
+                        st.markdown(content.get("summary", "_None_"))
                     else:
-                        st.markdown(content)
+                        st.markdown(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, indent=2))
+
             st.download_button(
                 "Download JSON",
-                data=json.dumps(parsed, indent=2),
+                data=json.dumps(parsed, indent=2, ensure_ascii=False),
                 file_name="note_output.json",
+                use_container_width=True
             )
