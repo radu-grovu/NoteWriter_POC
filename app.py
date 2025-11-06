@@ -1,6 +1,7 @@
 import json
 import os
 import textwrap
+from datetime import datetime, timedelta, date
 import streamlit as st
 
 # OpenAI SDK v1.x
@@ -11,16 +12,21 @@ from openai import OpenAI
 # -----------------------
 st.set_page_config(page_title="NoteWriter – Text-Only (MyStyle)", layout="wide")
 st.title("NoteWriter – Text-Only (MyStyle)")
-st.caption("Paste labeled clinical text → get HPI, A&P, Physical Exam, and Med Review")
+st.caption("Paste labeled clinical text → get HPI, A&P (hashtag problems, med dosing/status), Physical Exam, and a structured Medication Review")
 
-# Predefined friendly model list (you can edit this)
+# Dates used for medication cutoff logic passed to the model
+today = date.today()
+six_months_ago = today - timedelta(days=183)  # ~6 months buffer
+TODAY_STR = today.isoformat()
+CUTOFF_STR = six_months_ago.isoformat()
+
+# Predefined friendly model list (edit if needed)
 FRIENDLY_MODELS = [
     ("ChatGPT-5 (recommended)", "gpt-5"),
     ("ChatGPT-5 Pro (bigger, pricier)", "gpt-5-pro"),
     ("ChatGPT-5 Mini (fast/cheap)", "gpt-5-mini"),
     ("GPT-4.1", "gpt-4.1"),
 ]
-
 FRIENDLY_MODEL_NAMES = [name for name, _id in FRIENDLY_MODELS]
 MODEL_NAME_TO_ID = {name: mid for name, mid in FRIENDLY_MODELS}
 
@@ -41,7 +47,7 @@ with st.sidebar:
     )
     model = MODEL_NAME_TO_ID[chosen_friendly]
 
-    # Optional: allow a custom override (for advanced users)
+    # Optional: allow a custom override and fallback
     with st.expander("Advanced model options"):
         custom_model = st.text_input(
             "Custom model ID (optional)",
@@ -60,7 +66,7 @@ with st.sidebar:
     if custom_model.strip():
         model = custom_model.strip()
 
-    max_tokens = st.slider("Max output tokens", 300, 4000, 1600, 50)
+    max_tokens = st.slider("Max output tokens", 300, 4000, 1800, 50)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
 
     st.divider()
@@ -68,8 +74,9 @@ with st.sidebar:
     ed_instr = st.text_area(
         "ED Note instructions",
         value=(
-            "Extract chief complaint, initial HPI timeline, and pertinent positives/negatives. "
-            "Resolve obvious contradictions with labs/imaging when appropriate."
+            "Identify presenting complaint and acute timeline. "
+            "Highlight new findings or symptoms differing from chronic baseline. "
+            "Summarize consultations and ED management steps."
         ),
         height=120
     )
@@ -84,8 +91,8 @@ with st.sidebar:
     labs_instr = st.text_area(
         "Labs instructions",
         value=(
-            "Trend key labs (CBC, CMP, troponin, BNP, lactate). "
-            "Flag critical values, significant deltas, and likely implications."
+            "Include only significant abnormal or trending results. "
+            "Use compact notation (e.g., 'WBC 15.4 ↑, ESR 93 ↑, CRP 47 ↑')."
         ),
         height=120
     )
@@ -100,8 +107,8 @@ with st.sidebar:
     meds_instr = st.text_area(
         "Med List instructions",
         value=(
-            "Reconcile inpatient vs outpatient. Identify omissions, duplications, interactions, "
-            "renally-dosed agents, and QT-prolongers."
+            "State home and inpatient meds with doses. "
+            "Mark held meds with '– Holding' and include rationale if known."
         ),
         height=120
     )
@@ -118,11 +125,21 @@ with st.sidebar:
     hpi_style = st.text_area(
         "HPI Style",
         value=(
-            "Chronological narrative of symptom onset and evolution with context. "
-            "Include pertinent positives/negatives and salient past history that informs the presentation. "
-            "Avoid repeating exam or lab details unless essential to the timeline."
+            "Start with patient age, sex, and reason for admission.\n"
+            "Then show PMH line by line, organized by organ system:\n"
+            "- Cardiac: …\n"
+            "- Pulmonary: …\n"
+            "- Renal: …\n"
+            "- Endocrine: …\n"
+            "- Neuro/Psych: …\n"
+            "- Musculoskeletal: …\n"
+            "- Other chronic issues: …\n"
+            "\n"
+            "Next, summarize current presentation using short declarative sentences, "
+            "emphasizing changes from baseline, functional status, and key limitations. "
+            "Highlight when pain/symptoms differ from chronic pattern. Include notable social/functional details."
         ),
-        height=140
+        height=220
     )
     hp_style = st.text_area(
         "Physical Exam (HP) Style",
@@ -133,23 +150,31 @@ with st.sidebar:
         height=140
     )
 
-    # Assessment & Plan style editor
+    # Assessment & Plan style editor — with hashtag problem headings and explicit med status/dosing
     ap_style = st.text_area(
         "Assessment & Plan Style",
         value=(
-            "# Problem 1 – short title\n"
-            "- Assessment: pathophysiology, differential, supporting data\n"
-            "- Workup: tests/consults and monitoring\n"
-            "- Treatment: meds with dose/route, supportive care, safety notes\n"
-            "\n# Problem 2 – ...\n"
+            "For each active problem (use hashtag heading):\n"
+            "# Problem Title – brief\n"
+            "- Assessment: significance, relevant PMH, and key findings (vitals, imaging, labs).\n"
+            "- Plan: diagnostics, consults, management. "
+            "List medications with name, dose, route, frequency, and status (continued/started/changed/holding) with reasoning. "
+            "Include follow-up items (f/u) and monitoring.\n"
+            "\n"
+            "After system-based problems, include short lines for:\n"
+            "- DVT prophylaxis\n"
+            "- Activity\n"
+            "- Diet\n"
+            "- Code status\n"
+            "- Disposition / Med reconciliation summary"
         ),
-        height=180
+        height=260
     )
 
 # -----------------------
 # MAIN INPUT AREAS
 # -----------------------
-st.subheader("Paste Inputs (labelled sources)")
+st.subheader("Paste Inputs (labeled sources)")
 
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -171,39 +196,76 @@ st.divider()
 # -----------------------
 def build_instruction_block() -> str:
     """
-    Build the global instruction block including style controls and strict JSON schema.
+    Build the global instruction block including style controls, six-month med cutoff, and strict JSON schema.
     """
-    return textwrap.dedent(f"""
+    formatting_guidance = (
+        "Formatting guidance:\n"
+        "- Always reproduce PMH as a labeled section before the narrative in HPI.\n"
+        "- Maintain line breaks between items.\n"
+        "- Use abbreviations such as PMH, CKD, COPD, HTN, DM2, CHF, AICD.\n"
+        "- Avoid fluff; use short clinical sentences.\n"
+        "- In A&P, prefix each problem with a hashtag heading ('# ').\n"
+        "- Under each problem, show relevant objective data (labs/imaging/ECG) as bullets.\n"
+        "- For each medication tied to a problem, include name, dose, route, frequency, and status: "
+        "continued | started | changed | holding, with brief rationale.\n"
+    )
+
+    med_review_rules = (
+        f"Medication Review rules (current date: {TODAY_STR}; 6-month cutoff: {CUTOFF_STR}):\n"
+        f"- Exclude from 'included_medications' any medication last prescribed BEFORE {CUTOFF_STR}.\n"
+        "- Present Medication Review as structured sections: included_medications, excluded_medications, "
+        "redundancies, interactions, side_effects_relevant, and a concise summary.\n"
+        "- 'excluded_medications' should include the last_prescribed_date (if known) and reason "
+        "(older_than_6_months | not_relevant | duplicate).\n"
+        "- Identify and list redundant or incorrect medications.\n"
+        "- Identify key interactions and side effects relevant to this patient's presentation/problems.\n"
+    )
+
+    schema = (
+        "Output strictly the following JSON schema:\n"
+        "{\n"
+        '  "hpi": "string",\n'
+        '  "assessment_plan": "string",\n'
+        '  "physical_exam": "string",\n'
+        '  "medication_review": {\n'
+        '    "included_medications": [\n'
+        '      {"name": "string", "dose": "string", "route": "string", "frequency": "string", '
+        '"indication": "string", "status": "continued|started|changed|holding", "notes": "string"}\n'
+        '    ],\n'
+        '    "excluded_medications": [\n'
+        '      {"name": "string", "last_prescribed_date": "YYYY-MM-DD or unknown", '
+        '"reason": "older_than_6_months|not_relevant|duplicate"}\n'
+        '    ],\n'
+        '    "redundancies": ["string"],\n'
+        '    "interactions": ["string"],\n'
+        '    "side_effects_relevant": ["string"],\n'
+        '    "summary": "string"\n'
+        '  },\n'
+        '  "source_summary": "string"\n'
+        "}\n"
+        "- Return ONLY the JSON object. No surrounding text, no code fences.\n"
+    )
+
+    header = textwrap.dedent(f"""
     You are a clinical note assistant producing output in JSON only.
     You receive multiple labeled inputs and per-section instructions.
 
     Tasks:
       1) Compose an HPI following this style:
          {hpi_style}
-      2) Compose a problem-oriented Assessment & Plan in this style:
+      2) Compose a problem-oriented Assessment & Plan in this style (problems as '# Problem …'):
          {ap_style}
       3) Compose a Physical Exam (HP) section following this style:
          {hp_style}
-      4) Create a Medication Review: reconciliation, discrepancies, safety flags, dosing adjustments, interactions/QT concerns, renal/hepatic considerations.
+      4) Create a structured Medication Review enforcing the 6-month cutoff and sections as defined below.
       5) Add a brief Source Summary mapping key statements to the input(s) they came from.
 
-    Rules:
-      - Be specific, evidence-based, and internally consistent.
-      - Prefer objective data over narrative when conflicting.
-      - Quote nothing verbatim; summarize.
-      - Keep HPI ≤ 180 words unless essential.
-      - In A&P, include workup and treatment with dose/route when applicable.
-      - Make medication safety notes explicit.
-      - Output strictly the following JSON schema:
+    {formatting_guidance}
+    {med_review_rules}
+    {schema}
+    """)
 
-      {{
-        "hpi": "string",
-        "assessment_plan": "string",
-        "physical_exam": "string",
-        "medication_review": "string",
-        "source_summary": "string"
-      }}
-
+    per_section = textwrap.dedent(f"""
     Per-section instructions the model must follow:
       - ED Note: {ed_instr}
       - Prior Discharge: {disc_instr}
@@ -212,6 +274,8 @@ def build_instruction_block() -> str:
       - Med List: {meds_instr}
       - Free Text: {free_instr}
     """)
+
+    return header + "\n" + per_section
 
 def build_inputs_block():
     """
@@ -239,7 +303,7 @@ def assemble_prompt() -> str:
     user_payload = (
         f"{instruction}\n\n"
         f"INPUTS_JSON:\n{inputs_json}\n\n"
-        f"Return only the JSON object, no commentary."
+        f"Return only the JSON object."
     )
     return user_payload
 
@@ -253,7 +317,6 @@ def _try_responses_api(client: OpenAI, user_payload: str, model_id: str, max_tok
         max_output_tokens=max_tokens,
         temperature=temperature,
     )
-    # Newer SDKs expose this convenience:
     text = getattr(resp, "output_text", None)
     if not text:
         if hasattr(resp, "output") and len(resp.output) > 0 and "content" in resp.output[0]:
@@ -313,6 +376,81 @@ def call_model_with_optional_fallback(user_payload: str, primary_model: str, fal
     return None
 
 # -----------------------
+# RENDER HELPERS
+# -----------------------
+def render_med_review(med_review):
+    """
+    Render the structured medication review (dict) with sections.
+    """
+    if isinstance(med_review, str):
+        st.markdown(med_review)
+        return
+
+    # Included medications
+    st.markdown("### Included Medications")
+    included = med_review.get("included_medications", [])
+    if included:
+        for m in included:
+            name = m.get("name", "")
+            dose = m.get("dose", "")
+            route = m.get("route", "")
+            freq = m.get("frequency", "")
+            indication = m.get("indication", "")
+            status = m.get("status", "")
+            notes = m.get("notes", "")
+            line = f"- **{name}** — {dose} {route} {freq}  • *{status}*"
+            if indication:
+                line += f"  • Indication: {indication}"
+            if notes:
+                line += f"  • Notes: {notes}"
+            st.markdown(line)
+    else:
+        st.markdown("_None listed_")
+
+    # Excluded medications
+    st.markdown("### Excluded Medications")
+    excluded = med_review.get("excluded_medications", [])
+    if excluded:
+        for m in excluded:
+            name = m.get("name", "")
+            lpd = m.get("last_prescribed_date", "unknown")
+            reason = m.get("reason", "")
+            st.markdown(f"- **{name}** — last prescribed: {lpd} • reason: {reason}")
+    else:
+        st.markdown("_None listed_")
+
+    # Redundancies
+    st.markdown("### Redundancies / Incorrect")
+    redundancies = med_review.get("redundancies", [])
+    if redundancies:
+        for r in redundancies:
+            st.markdown(f"- {r}")
+    else:
+        st.markdown("_None identified_")
+
+    # Interactions
+    st.markdown("### Interactions")
+    interactions = med_review.get("interactions", [])
+    if interactions:
+        for it in interactions:
+            st.markdown(f"- {it}")
+    else:
+        st.markdown("_None identified_")
+
+    # Side effects relevant
+    st.markdown("### Side Effects Relevant to Case")
+    se = med_review.get("side_effects_relevant", [])
+    if se:
+        for sfx in se:
+            st.markdown(f"- {sfx}")
+    else:
+        st.markdown("_None highlighted_")
+
+    # Summary
+    st.markdown("### Summary")
+    st.markdown(med_review.get("summary", "_No summary provided_"))
+
+# -----------------------
 # RUN BUTTON
 # -----------------------
 if st.button("Generate Note", type="primary"):
@@ -353,11 +491,12 @@ if st.button("Generate Note", type="primary"):
             with tab1:
                 st.markdown(parsed["hpi"])
             with tab2:
+                # Ensure hashtag headings render as headers in Streamlit markdown
                 st.markdown(parsed["assessment_plan"])
             with tab3:
                 st.markdown(parsed["physical_exam"])
             with tab4:
-                st.markdown(parsed["medication_review"])
+                render_med_review(parsed["medication_review"])
             with tab5:
                 st.markdown(parsed["source_summary"])
 
