@@ -1,6 +1,0 @@
-{
-  "name": "NoteWriter",
-  "image": "mcr.microsoft.com/devcontainers/python:3.12",
-  "forwardPorts": [8501],
-  "postCreateCommand": "pip install -r requirements.txt"
-}
