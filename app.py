@@ -22,7 +22,6 @@ def get_input_area(key: str, label: str, **kwargs):
 
 def set_input_from_testcase(tc: dict):
     """Populate all main inputs from a loaded test case dict."""
-    # Accept either titled keys or snake_case
     def pull(d, *names):
         for n in names:
             if n in d and isinstance(d[n], str):
@@ -38,12 +37,50 @@ def set_input_from_testcase(tc: dict):
 # =========================
 # Page setup
 # =========================
-st.set_page_config(page_title="NoteWriter – MyStyle (Test Case Mode)", layout="wide")
+st.set_page_config(page_title="NoteWriter – MyStyle (Test Case + Prompt Save/Load)", layout="wide")
 st.title("NoteWriter – Text-Only (MyStyle)")
-st.caption("Upload a test case → tune prompts in the sidebar → re-run instantly to evaluate output")
+st.caption("Upload a test case and/or prompts → tune sidebar → re-run instantly to evaluate output")
 
 today = date.today()
 cutoff = today - timedelta(days=183)  # ~6 months
+
+# Keys included in prompt config save/load
+PROMPT_KEYS_AND_DEFAULTS = {
+    "ed_instr":   "Identify presenting complaint, acute timeline, and new findings differing from baseline.",
+    "disc_instr": "Summarize durable diagnoses, baseline functional status, long-term meds. Exclude resolved inpatient-only issues.",
+    "labs_instr": "List only significant or trending abnormal results, e.g., 'WBC 15.4 ↑, ESR 93 ↑, CRP 47 ↑'.",
+    "img_instr":  "Highlight new or worsening findings relevant to current complaint.",
+    "meds_instr": "List home/inpatient meds with dose and status. Mark held meds with '– Holding' and reason.",
+    "free_instr": "Supplemental context (consult pearls, nursing notes). Do not override objective data.",
+    "hpi_style": (
+        "Start with age/sex/admission reason. Then PMH by organ system:\n"
+        "- Cardiac:\n- Pulmonary:\n- Renal:\n- Endocrine:\n- Neuro/Psych:\n- Musculoskeletal:\n"
+        "Then describe acute presentation, differences from baseline, functional status, and social context."
+    ),
+    "hp_style": (
+        "Organize by system: General, HEENT, Cardiac, Pulmonary, Abdomen, Neuro, Skin, Extremities. "
+        "Keep concise, emphasize abnormal findings."
+    ),
+    "ap_style": (
+        "Each problem starts with a hashtag heading.\n"
+        "# Problem Title – concise\n"
+        "- Assessment: key data (vitals, labs, imaging) and PMH relevance.\n"
+        "- Plan: diagnostics, consults, and meds (dose/route/frequency/status). "
+        "State if continued, started, changed, or holding, with rationale.\n"
+        "Finish with DVT prophylaxis, diet, activity, code status, disposition, med reconciliation."
+    ),
+}
+
+def load_prompt_config_into_session(cfg: dict):
+    """Load prompt settings from uploaded JSON into session_state BEFORE widgets render."""
+    for k, default in PROMPT_KEYS_AND_DEFAULTS.items():
+        if k in cfg and isinstance(cfg[k], str):
+            st.session_state[k] = cfg[k]
+        elif k not in st.session_state:
+            st.session_state[k] = default  # ensure presence
+
+def current_prompt_config_from_session() -> dict:
+    return {k: st.session_state.get(k, v) for k, v in PROMPT_KEYS_AND_DEFAULTS.items()}
 
 # =========================
 # Sidebar
@@ -62,8 +99,23 @@ with st.sidebar:
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
 
     st.divider()
+    st.subheader("Prompt Config (Save / Load)")
+
+    # Prompt config uploader (loads BEFORE prompt widgets render)
+    up_prompts = st.file_uploader("Load prompts (.json)", type=["json"], key="prompt_uploader")
+    if up_prompts is not None:
+        try:
+            cfg = json.loads(up_prompts.getvalue().decode("utf-8"))
+            if not isinstance(cfg, dict):
+                raise ValueError("Uploaded JSON must be an object with string fields.")
+            load_prompt_config_into_session(cfg)
+            st.success("Prompts loaded.")
+        except Exception as e:
+            st.error(f"Failed to load prompts: {e}")
+
+    st.divider()
     st.subheader("Test Case")
-    # Load a test case JSON (before main inputs are created)
+    # Test case JSON upload (inputs)
     uploaded_tc = st.file_uploader("Load test case (.json)", type=["json"], key="testcase_uploader")
     if uploaded_tc is not None:
         try:
@@ -73,19 +125,21 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Failed to load test case: {e}")
 
-    # Download current inputs as a test case
-    if st.button("📥 Download current inputs as test_case.json"):
+    # Download current inputs as test_case.json
+    if st.button("📥 Prepare current inputs for download"):
         current_tc = {
-            "ED Note":          st.session_state.get("ed_note_input", ""),
-            "Prior Discharge":  st.session_state.get("prior_discharge_input", ""),
-            "Labs":             st.session_state.get("labs_input", ""),
-            "Imaging":          st.session_state.get("imaging_input", ""),
-            "Med List":         st.session_state.get("med_list_input", ""),
-            "Free Text":        st.session_state.get("free_text_input", ""),
+            "ED Note":         st.session_state.get("ed_note_input", ""),
+            "Prior Discharge": st.session_state.get("prior_discharge_input", ""),
+            "Labs":            st.session_state.get("labs_input", ""),
+            "Imaging":         st.session_state.get("imaging_input", ""),
+            "Med List":        st.session_state.get("med_list_input", ""),
+            "Free Text":       st.session_state.get("free_text_input", ""),
         }
+        st.session_state["_prepared_testcase_json"] = json.dumps(current_tc, indent=2, ensure_ascii=False)
+    if "_prepared_testcase_json" in st.session_state:
         st.download_button(
             "Save test_case.json",
-            data=json.dumps(current_tc, indent=2, ensure_ascii=False),
+            data=st.session_state["_prepared_testcase_json"],
             file_name="test_case.json",
             mime="application/json",
             use_container_width=True
@@ -103,37 +157,37 @@ with st.sidebar:
     ed_instr = get_text_area(
         "ed_instr",
         "ED Note instructions",
-        "Identify presenting complaint, acute timeline, and new findings differing from baseline.",
+        PROMPT_KEYS_AND_DEFAULTS["ed_instr"],
         height=120,
     )
     disc_instr = get_text_area(
         "disc_instr",
         "Prior Discharge instructions",
-        "Summarize durable diagnoses, baseline functional status, long-term meds. Exclude resolved inpatient-only issues.",
+        PROMPT_KEYS_AND_DEFAULTS["disc_instr"],
         height=120,
     )
     labs_instr = get_text_area(
         "labs_instr",
         "Labs instructions",
-        "List only significant or trending abnormal results, e.g., 'WBC 15.4 ↑, ESR 93 ↑, CRP 47 ↑'.",
+        PROMPT_KEYS_AND_DEFAULTS["labs_instr"],
         height=120,
     )
     img_instr = get_text_area(
         "img_instr",
         "Imaging instructions",
-        "Highlight new or worsening findings relevant to current complaint.",
+        PROMPT_KEYS_AND_DEFAULTS["img_instr"],
         height=120,
     )
     meds_instr = get_text_area(
         "meds_instr",
         "Med List instructions",
-        "List home/inpatient meds with dose and status. Mark held meds with '– Holding' and reason.",
+        PROMPT_KEYS_AND_DEFAULTS["meds_instr"],
         height=120,
     )
     free_instr = get_text_area(
         "free_instr",
         "Free Text instructions",
-        "Supplemental context (consult pearls, nursing notes). Do not override objective data.",
+        PROMPT_KEYS_AND_DEFAULTS["free_instr"],
         height=120,
     )
 
@@ -143,28 +197,32 @@ with st.sidebar:
     hpi_style = get_text_area(
         "hpi_style",
         "HPI Style",
-        "Start with age/sex/admission reason. Then PMH by organ system:\n"
-        "- Cardiac:\n- Pulmonary:\n- Renal:\n- Endocrine:\n- Neuro/Psych:\n- Musculoskeletal:\n"
-        "Then describe acute presentation, differences from baseline, functional status, and social context.",
+        PROMPT_KEYS_AND_DEFAULTS["hpi_style"],
         height=200,
     )
     hp_style = get_text_area(
         "hp_style",
         "Physical Exam (HP) Style",
-        "Organize by system: General, HEENT, Cardiac, Pulmonary, Abdomen, Neuro, Skin, Extremities. "
-        "Keep concise, emphasize abnormal findings.",
+        PROMPT_KEYS_AND_DEFAULTS["hp_style"],
         height=120,
     )
     ap_style = get_text_area(
         "ap_style",
         "Assessment & Plan Style",
-        "Each problem starts with a hashtag heading.\n"
-        "# Problem Title – concise\n"
-        "- Assessment: key data (vitals, labs, imaging) and PMH relevance.\n"
-        "- Plan: diagnostics, consults, and meds (dose/route/frequency/status). "
-        "State if continued, started, changed, or holding, with rationale.\n"
-        "Finish with DVT prophylaxis, diet, activity, code status, disposition, med reconciliation.",
+        PROMPT_KEYS_AND_DEFAULTS["ap_style"],
         height=250,
+    )
+
+    # Download current prompts as prompt_config.json
+    st.divider()
+    st.subheader("Export Current Prompts")
+    prompt_cfg_json = json.dumps(current_prompt_config_from_session(), indent=2, ensure_ascii=False)
+    st.download_button(
+        "💾 Save prompt_config.json",
+        data=prompt_cfg_json,
+        file_name="prompt_config.json",
+        mime="application/json",
+        use_container_width=True
     )
 
 # =========================
@@ -220,17 +278,17 @@ JSON schema:
 }}
 
 Styles:
-- HPI: {hpi_style}
-- Physical Exam: {hp_style}
-- A&P: {ap_style}
+- HPI: {st.session_state.get("hpi_style")}
+- Physical Exam: {st.session_state.get("hp_style")}
+- A&P: {st.session_state.get("ap_style")}
 
 Per-section instructions:
-- ED Note: {ed_instr}
-- Prior Discharge: {disc_instr}
-- Labs: {labs_instr}
-- Imaging: {img_instr}
-- Med List: {meds_instr}
-- Free Text: {free_instr}
+- ED Note: {st.session_state.get("ed_instr")}
+- Prior Discharge: {st.session_state.get("disc_instr")}
+- Labs: {st.session_state.get("labs_instr")}
+- Imaging: {st.session_state.get("img_instr")}
+- Med List: {st.session_state.get("meds_instr")}
+- Free Text: {st.session_state.get("free_instr")}
 """
     inputs = [
         {"label": "ED Note", "text": ed_note},
@@ -240,8 +298,18 @@ Per-section instructions:
         {"label": "Med List", "text": med_list},
         {"label": "Free Text", "text": free_text},
     ]
-    inputs_json = json.dumps([i for i in inputs if i["text"].strip()], ensure_ascii=False)
+    inputs_json = json.dumps([i for i in inputs if isinstance(i["text"], str) and i["text"].strip()], ensure_ascii=False)
     return f"{instruction}\n\nINPUTS_JSON:\n{inputs_json}\n\nReturn only JSON."
+
+# Button to download the currently assembled prompt (for testing/debug)
+assembled_prompt_str = build_prompt()
+st.download_button(
+    "📄 Download assembled_prompt.txt",
+    data=assembled_prompt_str,
+    file_name="assembled_prompt.txt",
+    mime="text/plain",
+    use_container_width=True
+)
 
 # =========================
 # Model call
@@ -285,7 +353,7 @@ def call_model(prompt, model, fallback, max_tokens, temperature):
 # =========================
 if st.button("Generate Note", type="primary"):
     with st.spinner(f"Generating with {model}..."):
-        result = call_model(build_prompt(), model, fallback_model, max_tokens, temperature)
+        result = call_model(assembled_prompt_str, model, fallback_model, max_tokens, temperature)
 
     if not result:
         st.error("No output received.")
