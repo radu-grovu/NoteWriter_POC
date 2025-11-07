@@ -366,10 +366,7 @@ if st.button("Generate Note", type="primary", key="generate_btn"):
             cleaned = result.strip()
             if cleaned.startswith("```"):
                 cleaned = re.sub(r"^```(json)?", "", cleaned, flags=re.IGNORECASE).strip("` \n")
-            parsed…continuing the last few lines of the code (to complete the JSON parsing and tab rendering section):
-
-```python
-            parsed = json.loads(cleaned)
+                parsed = json.loads(cleaned)
         except json.JSONDecodeError:
             last_brace = cleaned.rfind("}")
             parsed = None
