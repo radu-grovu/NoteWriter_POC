@@ -1,4 +1,4 @@
 streamlit==1.38
 openai>=1.40.0
-supabase-client==<latest>        # or the correct pip package name
-st-supabase-connection==<latest> # makes integration easie
+st-supabase-connection
+
