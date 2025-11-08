@@ -1,24 +1,42 @@
 import json
-import os
 import re
 import textwrap
 from datetime import date, timedelta
 import streamlit as st
 from openai import OpenAI
+from st_supabase_connection import SupabaseConnection
 
 # =========================================
 # Page setup
 # =========================================
 st.set_page_config(page_title="NoteWriter – MyStyle IDE", layout="wide")
-st.title("NoteWriter – MyStyle IDE")
-st.caption("Version, test, and optimize your medical note prompts directly on site (no local files).")
+st.title("NoteWriter – MyStyle IDE (Supabase-Backed)")
+st.caption("Prompts, styles, and test cases now persist permanently via Supabase.")
 
 TODAY = date.today()
 CUTOFF = TODAY - timedelta(days=183)
 
-PROMPT_STORE_FILE = "prompt_versions.json"
-TESTCASE_STORE_FILE = "test_cases.json"
+# =========================================
+# Connect to Supabase
+# =========================================
+supabase = st.connection("supabase_conn", type=SupabaseConnection)
 
+# Ensure tables exist
+def init_supabase_tables():
+    try:
+        supabase.table("prompt_versions").select("*").limit(1).execute()
+    except Exception:
+        st.warning("Create table 'prompt_versions' in Supabase.")
+    try:
+        supabase.table("test_cases").select("*").limit(1).execute()
+    except Exception:
+        st.warning("Create table 'test_cases' in Supabase.")
+
+init_supabase_tables()
+
+# =========================================
+# Defaults
+# =========================================
 PROMPT_DEFAULTS = {
     "ed_instr":   "Identify presenting complaint, acute timeline, and new findings differing from baseline.",
     "disc_instr": "Summarize durable diagnoses, baseline functional status, long-term meds. Exclude resolved inpatient-only issues.",
@@ -33,125 +51,65 @@ PROMPT_DEFAULTS = {
     ),
     "ap_style": (
         "Organize each problem in order of clinical priority.\n"
-        "For each, start with a hashtag heading:\n"
         "# Problem – concise title (e.g., Hyponatremia, CHF, COPD exacerbation)\n\n"
-        "- **Impression:** One-line interpretation of current state and likely etiology. "
-        "Use 'stable', 'improving', 'uncontrolled', or 'resolved' when appropriate.\n"
-        "- **Supporting Data:** Key objective findings (labs, imaging, vitals, exam) supporting the impression.\n"
-        "- **Treatment Plan:** Meds with dose/route/frequency and status (continued/started/changed/holding), "
+        "- **Impression:** One-line interpretation of current state and likely etiology.\n"
+        "- **Supporting Data:** Key objective findings (labs, imaging, vitals, exam).\n"
+        "- **Treatment Plan:** Meds with dose/route/frequency/status (continued/started/changed/holding), "
         "plus interventions and monitoring.\n"
-        "- **Follow-up & Consults:** Next steps (tests, imaging, labs), consults, and monitoring intervals.\n\n"
-        "End with global orders: DVT prophylaxis, Activity, Diet, Code status, Disposition/anticipated course."
+        "- **Follow-up & Consults:** Next steps (tests, imaging, labs, consults, monitoring).\n\n"
+        "End with global orders: DVT prophylaxis, Activity, Diet, Code status, Disposition."
     ),
 }
 
 # =========================================
-# Local JSON storage helpers
+# Supabase helpers
 # =========================================
-def _init_store_file(path: str, default_obj: dict):
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(default_obj, f, indent=2, ensure_ascii=False)
+def get_prompt_versions():
+    data = supabase.table("prompt_versions").select("*").execute().data or []
+    return {d["version_name"]: d["config"] for d in data}
 
-def _load_json(path: str, fallback: dict) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        _init_store_file(path, fallback)
-        return fallback
+def save_prompt_version(name, config):
+    supabase.table("prompt_versions").upsert({"version_name": name, "config": config}).execute()
 
-def _save_json(path: str, obj: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
+def delete_prompt_version(name):
+    supabase.table("prompt_versions").delete().eq("version_name", name).execute()
 
-# Initialize files
-_init_store_file(PROMPT_STORE_FILE, {"versions": {"Default": PROMPT_DEFAULTS}, "selected": "Default"})
-_init_store_file(TESTCASE_STORE_FILE, {"cases": {"Blank": {
-    "ED Note": "", "Prior Discharge": "", "Labs": "", "Imaging": "", "Med List": "", "Free Text": ""
-}}, "selected": "Blank"})
+def get_test_cases():
+    data = supabase.table("test_cases").select("*").execute().data or []
+    return {d["case_name"]: d["inputs"] for d in data}
 
-def load_prompt_store():
-    return _load_json(PROMPT_STORE_FILE, {"versions": {"Default": PROMPT_DEFAULTS}, "selected": "Default"})
+def save_test_case(name, inputs):
+    supabase.table("test_cases").upsert({"case_name": name, "inputs": inputs}).execute()
 
-def save_prompt_store(store: dict):
-    _save_json(PROMPT_STORE_FILE, store)
-
-def load_testcase_store():
-    return _load_json(TESTCASE_STORE_FILE, {"cases": {"Blank": {
-        "ED Note": "", "Prior Discharge": "", "Labs": "", "Imaging": "", "Med List": "", "Free Text": ""
-    }}, "selected": "Blank"})
-
-def save_testcase_store(store: dict):
-    _save_json(TESTCASE_STORE_FILE, store)
+def delete_test_case(name):
+    supabase.table("test_cases").delete().eq("case_name", name).execute()
 
 # =========================================
-# Session-safe text areas
+# Widgets
 # =========================================
-def session_text_area(key: str, label: str, default: str, **kwargs):
+def session_text_area(key, label, default, **kw):
     value = st.session_state.get(key, default)
-    return st.text_area(label, value=value, key=key, **kwargs)
+    return st.text_area(label, value=value, key=key, **kw)
 
-def session_input_area(key: str, label: str, **kwargs):
+def session_input_area(key, label, **kw):
     value = st.session_state.get(key, "")
-    return st.text_area(label, value=value, key=key, **kwargs)
+    return st.text_area(label, value=value, key=key, **kw)
 
 # =========================================
-# Model call
-# =========================================
-def call_model(prompt: str, model: str, fallback: str | None, max_tokens: int, temperature: float):
-    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        st.error("No API key found.")
-        return None
-    client = OpenAI(api_key=api_key)
-    try:
-        resp = client.responses.create(
-            model=model,
-            input=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-            max_output_tokens=max_tokens,
-            temperature=temperature,
-        )
-        if hasattr(resp, "output_text") and resp.output_text:
-            return resp.output_text
-    except Exception:
-        pass
-    if fallback:
-        try:
-            chat = client.chat.completions.create(
-                model=fallback,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-            return chat.choices[0].message.content
-        except Exception as e:
-            st.error(f"Model error: {e}")
-    return None
-
-# =========================================
-# Prompt builder (no Physical Exam)
+# Build prompt
 # =========================================
 def build_prompt():
     get = st.session_state.get
     instruction = f"""
 You are a professional internal medicine note writer producing output in JSON only.
-Be concise; audience are medical experts. Use standard acronyms.
+Audience are medical experts. Be concise and structured.
 
 Rules:
 - Problems in A&P start with hashtag headings (# Problem ...).
-- For each problem include: Impression (one line), Supporting Data (key objective values), Treatment Plan (meds with dose/route/frequency/status),
-  and Follow-up & Consults (tests, imaging, labs, consults/monitoring).
-- Exclude meds last prescribed before {CUTOFF.isoformat()} (6-month cutoff).
-- Medication Review must contain:
-  - included_medications
-  - excluded_medications (older_than_6_months | duplicate | not_relevant)
-  - redundancies
-  - interactions
-  - side_effects_relevant
-  - summary
+- For each: Impression, Supporting Data, Treatment Plan, Follow-up/Consults.
+- Exclude meds prescribed before {CUTOFF.isoformat()} (6-month cutoff).
 
-JSON schema (return ONLY JSON):
+JSON schema:
 {{
  "hpi": "string",
  "assessment_plan": "string",
@@ -180,248 +138,214 @@ Per-section instructions:
 - Free Text: {get("free_instr")}
 """
     inputs = [
-        {"label": "ED Note", "text": st.session_state.get("ed_note_input", "")},
-        {"label": "Prior Discharge", "text": st.session_state.get("prior_discharge_input", "")},
-        {"label": "Labs", "text": st.session_state.get("labs_input", "")},
-        {"label": "Imaging", "text": st.session_state.get("imaging_input", "")},
-        {"label": "Med List", "text": st.session_state.get("med_list_input", "")},
-        {"label": "Free Text", "text": st.session_state.get("free_text_input", "")},
+        {"label": "ED Note", "text": get("ed_note_input", "")},
+        {"label": "Prior Discharge", "text": get("prior_discharge_input", "")},
+        {"label": "Labs", "text": get("labs_input", "")},
+        {"label": "Imaging", "text": get("imaging_input", "")},
+        {"label": "Med List", "text": get("med_list_input", "")},
+        {"label": "Free Text", "text": get("free_text_input", "")},
     ]
     inputs_json = json.dumps([i for i in inputs if i["text"].strip()], ensure_ascii=False)
-    return f"{instruction}\n\nINPUTS_JSON:\n{inputs_json}\n\nReturn only JSON, complete and valid."
+    return f"{instruction}\n\nINPUTS_JSON:\n{inputs_json}\n\nReturn only JSON."
 
 # =========================================
-# UI – Model Settings
+# Model call
+# =========================================
+def call_model(prompt, model, fallback, max_tokens, temperature):
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        st.error("No API key found.")
+        return None
+    client = OpenAI(api_key=api_key)
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[{"role":"user","content":[{"type":"text","text":prompt}]}],
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if hasattr(resp, "output_text"):
+            return resp.output_text
+    except Exception:
+        pass
+    if fallback:
+        try:
+            chat = client.chat.completions.create(
+                model=fallback,
+                messages=[{"role":"user","content":prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return chat.choices[0].message.content
+        except Exception as e:
+            st.error(f"Model error: {e}")
+    return None
+
+# =========================================
+# UI: Model Settings
 # =========================================
 with st.expander("▸ Model Settings", expanded=True):
-    cols = st.columns(3)
-    with cols[0]:
-        model = st.selectbox("Model", ["gpt-4.1", "gpt-5", "gpt-5-pro", "gpt-5-mini"], index=0)
-    with cols[1]:
-        fallback_model = st.selectbox("Fallback model", ["None", "gpt-4.1", "gpt-5"], index=1)
-        if fallback_model == "None":
-            fallback_model = None
-    with cols[2]:
-        temperature = st.slider("Temperature", 0.0, 0.6, 0.2, 0.05)
-    max_tokens = st.slider("Max output tokens", 500, 8000, 4000, 100)
+    col = st.columns(3)
+    model = col[0].selectbox("Model", ["gpt-4.1","gpt-5","gpt-5-pro","gpt-5-mini"], index=0)
+    fallback_model = col[1].selectbox("Fallback", ["None","gpt-4.1","gpt-5"], index=1)
+    if fallback_model == "None": fallback_model=None
+    temperature = col[2].slider("Temperature",0.0,0.6,0.2,0.05)
+    max_tokens = st.slider("Max output tokens",500,8000,4000,100)
 
 # =========================================
-# Inputs & Test Cases
+# Test Case Manager
 # =========================================
-with st.expander("▸ Inputs", expanded=True):
-    tc_store = load_testcase_store()
-    tc_names = sorted(tc_store["cases"].keys())
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        selected_tc = st.selectbox("Saved Test Cases", tc_names, index=tc_names.index(tc_store.get("selected", "Blank")))
-    with col2:
-        new_tc_name = st.text_input("New Case Name", placeholder="e.g., Osteomyelitis Case")
-    with col3:
-        if st.button("Load Case", key="load_tc"):
-            case = tc_store["cases"].get(selected_tc, {})
-            for k, v in {
-                "ed_note_input": case.get("ED Note", ""),
-                "prior_discharge_input": case.get("Prior Discharge", ""),
-                "labs_input": case.get("Labs", ""),
-                "imaging_input": case.get("Imaging", ""),
-                "med_list_input": case.get("Med List", ""),
-                "free_text_input": case.get("Free Text", ""),
-            }.items():
-                st.session_state[k] = v
-            tc_store["selected"] = selected_tc
-            save_testcase_store(tc_store)
-            st.success(f"Loaded case: {selected_tc}")
-
-    cdup, cover, cdel = st.columns(3)
-    if cdup.button("Duplicate Selected", key="dup_tc"):
-        base = selected_tc
-        dup = f"{base} (copy)"
-        i = 2
-        while dup in tc_store["cases"]:
-            dup = f"{base} (copy {i})"
-            i += 1
-        tc_store["cases"][dup] = dict(tc_store["cases"][base])
-        tc_store["selected"] = dup
-        save_testcase_store(tc_store)
-        st.success(f"Duplicated to: {dup}")
-    if cover.button("Overwrite Selected", key="overwrite_tc"):
-        tc_store["cases"][selected_tc] = {
-            "ED Note": st.session_state.get("ed_note_input",""),
-            "Prior Discharge": st.session_state.get("prior_discharge_input",""),
-            "Labs": st.session_state.get("labs_input",""),
-            "Imaging": st.session_state.get("imaging_input",""),
-            "Med List": st.session_state.get("med_list_input",""),
-            "Free Text": st.session_state.get("free_text_input",""),
-        }
-        save_testcase_store(tc_store)
-        st.info(f"Overwrote: {selected_tc}")
-    if cdel.button("Delete Selected", key="delete_tc"):
-        if selected_tc != "Blank":
-            del tc_store["cases"][selected_tc]
-            tc_store["selected"] = "Blank"
-            save_testcase_store(tc_store)
-            st.warning(f"Deleted case: {selected_tc}")
-
-    st.markdown("---")
-    c1, c2, c3 = st.columns(3)
+with st.expander("▸ Inputs / Test Cases", expanded=True):
+    tc_dict = get_test_cases()
+    tc_names = sorted(tc_dict.keys())
+    c1,c2,c3 = st.columns([2,1,1])
     with c1:
-        session_input_area("ed_note_input", "ED Note", height=200)
-        session_input_area("prior_discharge_input", "Prior Discharge Note", height=200)
+        sel_case = st.selectbox("Saved Cases", tc_names, index=0)
     with c2:
-        session_input_area("labs_input", "Labs", height=200)
-        session_input_area("imaging_input", "Imaging Impressions", height=200)
+        new_case = st.text_input("New Case Name", "")
     with c3:
-        session_input_area("med_list_input", "Medication List", height=200)
-        session_input_area("free_text_input", "Free Text / Other", height=200)
-
-# =========================================
-# Section Instructions (Prompt Versions)
-# =========================================
-with st.expander("▸ Section Instructions", expanded=False):
-    store = load_prompt_store()
-    versions = sorted(store["versions"].keys())
-    vcol1, vcol2, vcol3 = st.columns([2,1,1])
-    with vcol1:
-        sel_version = st.selectbox("Saved Prompt Versions", versions, index=versions.index(store.get("selected","Default")))
-    with vcol2:
-        new_version_name = st.text_input("New Version Name", placeholder="e.g., MyStyle v3 – concise")
-    with vcol3:
-        if st.button("Load Version", key="load_ver"):
-            data = store["versions"].get(sel_version, PROMPT_DEFAULTS)
-            for k, v in PROMPT_DEFAULTS.items():
-                st.session_state[k] = data.get(k, v)
-            store["selected"] = sel_version
-            save_prompt_store(store)
-            st.success(f"Loaded version: {sel_version}")
-
-    colA, colB, colC, colD = st.columns(4)
-    if colA.button("Save as New", key="save_ver"):
-        name = new_version_name.strip() or f"Version {len(store['versions'])+1}"
-        store["versions"][name] = {k: st.session_state.get(k, v) for k, v in PROMPT_DEFAULTS.items()}
-        store["selected"] = name
-        save_prompt_store(store)
-        st.success(f"Saved version: {name}")
-    if colB.button("Duplicate Selected", key="dup_ver"):
-        base = sel_version
-        dup = f"{base} (copy)"
-        i = 2
-        while dup in store["versions"]:
-            dup = f"{base} (copy {i})"
-            i += 1
-        store["versions"][dup] = dict(store["versions"][base])
-        store["selected"] = dup
-        save_prompt_store(store)
-        st.success(f"Duplicated to: {dup}")
-    if colC.button("Overwrite Selected", key="overwrite_ver"):
-        store["versions"][sel_version] = {k: st.session_state.get(k, v) for k, v in PROMPT_DEFAULTS.items()}
-        save_prompt_store(store)
-        st.info(f"Overwrote version: {sel_version}")
-    if colD.button("Delete Selected", key="delete_ver"):
-        if sel_version != "Default":
-            del store["versions"][sel_version]
-            store["selected"] = "Default"
-            save_prompt_store(store)
-            st.warning(f"Deleted version: {sel_version}")
+        if st.button("Load", key="load_tc"):
+            case = tc_dict.get(sel_case,{})
+            for field,label in [("ed_note_input","ED Note"),("prior_discharge_input","Prior Discharge"),
+                                ("labs_input","Labs"),("imaging_input","Imaging"),
+                                ("med_list_input","Med List"),("free_text_input","Free Text")]:
+                st.session_state[field] = case.get(label,"")
+            st.success(f"Loaded case: {sel_case}")
+    cdup,cover,cdel=st.columns(3)
+    if cdup.button("Duplicate",key="dup_tc"):
+        dup=f"{sel_case} (copy)"
+        i=2
+        while dup in tc_dict: dup=f"{sel_case} (copy {i})"; i+=1
+        save_test_case(dup, tc_dict[sel_case])
+        st.success(f"Duplicated: {dup}")
+    if cover.button("Overwrite",key="overwrite_tc"):
+        data={ "ED Note":st.session_state.get("ed_note_input",""),
+               "Prior Discharge":st.session_state.get("prior_discharge_input",""),
+               "Labs":st.session_state.get("labs_input",""),
+               "Imaging":st.session_state.get("imaging_input",""),
+               "Med List":st.session_state.get("med_list_input",""),
+               "Free Text":st.session_state.get("free_text_input","") }
+        save_test_case(sel_case,data)
+        st.info(f"Overwrote: {sel_case}")
+    if cdel.button("Delete",key="delete_tc"):
+        delete_test_case(sel_case)
+        st.warning(f"Deleted case: {sel_case}")
 
     st.markdown("---")
-    col1, col2, col3 = st.columns(3)
+    colx=st.columns(3)
+    with colx[0]:
+        session_input_area("ed_note_input","ED Note",height=200)
+        session_input_area("prior_discharge_input","Prior Discharge",height=200)
+    with colx[1]:
+        session_input_area("labs_input","Labs",height=200)
+        session_input_area("imaging_input","Imaging Impressions",height=200)
+    with colx[2]:
+        session_input_area("med_list_input","Medication List",height=200)
+        session_input_area("free_text_input","Free Text / Other",height=200)
+
+# =========================================
+# Prompt Versions Manager
+# =========================================
+with st.expander("▸ Section Instructions / Styles", expanded=False):
+    versions = get_prompt_versions()
+    vnames = sorted(versions.keys())
+    col1,col2,col3=st.columns([2,1,1])
     with col1:
-        session_text_area("ed_instr", "ED Note instructions", PROMPT_DEFAULTS["ed_instr"], height=140)
-        session_text_area("disc_instr", "Prior Discharge instructions", PROMPT_DEFAULTS["disc_instr"], height=140)
+        sel_ver=st.selectbox("Saved Versions",vnames,index=0)
     with col2:
-        session_text_area("labs_instr", "Labs instructions", PROMPT_DEFAULTS["labs_instr"], height=140)
-        session_text_area("img_instr", "Imaging instructions", PROMPT_DEFAULTS["img_instr"], height=140)
+        new_ver=st.text_input("New Version Name","")
     with col3:
-        session_text_area("meds_instr", "Med List instructions", PROMPT_DEFAULTS["meds_instr"], height=140)
-        session_text_area("free_instr", "Free Text instructions", PROMPT_DEFAULTS["free_instr"], height=140)
+        if st.button("Load Version",key="load_ver"):
+            data=versions.get(sel_ver,PROMPT_DEFAULTS)
+            for k,v in PROMPT_DEFAULTS.items():
+                st.session_state[k]=data.get(k,v)
+            st.success(f"Loaded: {sel_ver}")
 
-# =========================================
-# Style Instructions
-# =========================================
-with st.expander("▸ Style Instructions", expanded=False):
-    colS1, colS2 = st.columns(2)
+    b1,b2,b3,b4=st.columns(4)
+    if b1.button("Save as New",key="save_ver"):
+        nm=new_ver.strip() or f"Version {len(vnames)+1}"
+        cfg={k:st.session_state.get(k,v) for k,v in PROMPT_DEFAULTS.items()}
+        save_prompt_version(nm,cfg)
+        st.success(f"Saved: {nm}")
+    if b2.button("Duplicate",key="dup_ver"):
+        dup=f"{sel_ver} (copy)"
+        i=2
+        while dup in versions: dup=f"{sel_ver} (copy {i})"; i+=1
+        save_prompt_version(dup,versions[sel_ver])
+        st.success(f"Duplicated: {dup}")
+    if b3.button("Overwrite",key="overwrite_ver"):
+        cfg={k:st.session_state.get(k,v) for k,v in PROMPT_DEFAULTS.items()}
+        save_prompt_version(sel_ver,cfg)
+        st.info(f"Overwrote: {sel_ver}")
+    if b4.button("Delete",key="delete_ver"):
+        delete_prompt_version(sel_ver)
+        st.warning(f"Deleted: {sel_ver}")
+
+    st.markdown("---")
+    c1,c2,c3=st.columns(3)
+    with c1:
+        session_text_area("ed_instr","ED Note instructions",PROMPT_DEFAULTS["ed_instr"],height=140)
+        session_text_area("disc_instr","Prior Discharge instructions",PROMPT_DEFAULTS["disc_instr"],height=140)
+    with c2:
+        session_text_area("labs_instr","Labs instructions",PROMPT_DEFAULTS["labs_instr"],height=140)
+        session_text_area("img_instr","Imaging instructions",PROMPT_DEFAULTS["img_instr"],height=140)
+    with c3:
+        session_text_area("meds_instr","Med List instructions",PROMPT_DEFAULTS["meds_instr"],height=140)
+        session_text_area("free_instr","Free Text instructions",PROMPT_DEFAULTS["free_instr"],height=140)
+
+    st.markdown("---")
+    colS1,colS2=st.columns(2)
     with colS1:
-        session_text_area("hpi_style", "HPI Style", PROMPT_DEFAULTS["hpi_style"], height=220)
+        session_text_area("hpi_style","HPI Style",PROMPT_DEFAULTS["hpi_style"],height=220)
     with colS2:
-        session_text_area("ap_style", "Assessment & Plan Style", PROMPT_DEFAULTS["ap_style"], height=300)
+        session_text_area("ap_style","Assessment & Plan Style",PROMPT_DEFAULTS["ap_style"],height=300)
 
 # =========================================
-# Assembled prompt + Run
+# Run
 # =========================================
-assembled_prompt_str = build_prompt()
-st.download_button("📄 Download assembled_prompt.txt",
-                   data=assembled_prompt_str,
-                   file_name="assembled_prompt.txt",
-                   mime="text/plain",
-                   use_container_width=True)
+assembled_prompt=build_prompt()
+st.download_button("📄 Download assembled_prompt.txt",data=assembled_prompt,file_name="assembled_prompt.txt",mime="text/plain")
 
-if st.button("Generate Note", type="primary", key="generate_btn"):
+if st.button("Generate Note",type="primary",key="gen_btn"):
     with st.spinner(f"Generating with {model}…"):
-        result = call_model(assembled_prompt_str, model, fallback_model, max_tokens, temperature)
-
+        result=call_model(assembled_prompt,model,fallback_model,max_tokens,temperature)
     if not result:
         st.error("No output received.")
     else:
-        parsed = None  # ensure variable exists even if parsing fails
-        cleaned = result.strip()
+        parsed=None
+        cleaned=result.strip()
         try:
             if cleaned.startswith("```"):
-                cleaned = re.sub(r"^```(json)?", "", cleaned, flags=re.IGNORECASE).strip("` \n")
-            parsed = json.loads(cleaned)
+                cleaned=re.sub(r"^```(json)?","",cleaned,flags=re.IGNORECASE).strip("` \n")
+            parsed=json.loads(cleaned)
         except json.JSONDecodeError:
-            last_brace = cleaned.rfind("}")
-            if last_brace != -1:
+            last=cleaned.rfind("}")
+            if last!=-1:
                 try:
-                    parsed = json.loads(cleaned[:last_brace + 1])
-                except Exception:
-                    pass
-
+                    parsed=json.loads(cleaned[:last+1])
+                except Exception: pass
         if not parsed:
             st.warning("Output not valid JSON. Showing raw output below.")
             st.code(result)
-
         else:
-            tabs = st.tabs(["HPI", "Assessment & Plan", "Medication Review", "Source Summary"])
-            keys = ["hpi", "assessment_plan", "medication_review", "source_summary"]
-            for tab, key in zip(tabs, keys):
+            tabs=st.tabs(["HPI","Assessment & Plan","Medication Review","Source Summary"])
+            keys=["hpi","assessment_plan","medication_review","source_summary"]
+            for tab,key in zip(tabs,keys):
                 with tab:
-                    content = parsed.get(key, "")
-                    if key == "medication_review" and isinstance(content, dict):
+                    content=parsed.get(key,"")
+                    if key=="medication_review" and isinstance(content,dict):
                         st.subheader("Included Medications")
-                        inc = content.get("included_medications", [])
-                        if inc:
-                            for m in inc:
-                                st.markdown(f"- {json.dumps(m, ensure_ascii=False)}")
-                        else:
-                            st.markdown("_None_")
-
+                        for m in content.get("included_medications",[]) or ["_None_"]:
+                            st.markdown(f"- {json.dumps(m,ensure_ascii=False)}")
                         st.subheader("Excluded Medications")
-                        exc = content.get("excluded_medications", [])
-                        if exc:
-                            for m in exc:
-                                st.markdown(f"- {json.dumps(m, ensure_ascii=False)}")
-                        else:
-                            st.markdown("_None_")
-
-                        st.subheader("Redundancies")
-                        for i in content.get("redundancies", []) or ["_None_"]:
-                            st.markdown(f"- {i}")
-
-                        st.subheader("Interactions")
-                        for i in content.get("interactions", []) or ["_None_"]:
-                            st.markdown(f"- {i}")
-
-                        st.subheader("Side Effects Relevant")
-                        for i in content.get("side_effects_relevant", []) or ["_None_"]:
-                            st.markdown(f"- {i}")
-
+                        for m in content.get("excluded_medications",[]) or ["_None_"]:
+                            st.markdown(f"- {json.dumps(m,ensure_ascii=False)}")
                         st.subheader("Summary")
-                        st.markdown(content.get("summary", "_None_"))
+                        st.markdown(content.get("summary","_None_"))
                     else:
-                        st.markdown(content if isinstance(content, str)
-                                    else json.dumps(content, ensure_ascii=False, indent=2))
-
+                        st.markdown(content if isinstance(content,str)
+                                    else json.dumps(content,ensure_ascii=False,indent=2))
             st.download_button("Download JSON",
-                               data=json.dumps(parsed, indent=2, ensure_ascii=False),
+                               data=json.dumps(parsed,indent=2,ensure_ascii=False),
                                file_name="note_output.json",
                                use_container_width=True)
