@@ -362,23 +362,24 @@ if st.button("Generate Note", type="primary", key="generate_btn"):
     if not result:
         st.error("No output received.")
     else:
+        parsed = None  # ensure variable exists even if parsing fails
+        cleaned = result.strip()
         try:
-            cleaned = result.strip()
             if cleaned.startswith("```"):
                 cleaned = re.sub(r"^```(json)?", "", cleaned, flags=re.IGNORECASE).strip("` \n")
-                parsed = json.loads(cleaned)
+            parsed = json.loads(cleaned)
         except json.JSONDecodeError:
             last_brace = cleaned.rfind("}")
-            parsed = None
             if last_brace != -1:
                 try:
-                    parsed = json.loads(cleaned[:last_brace+1])
+                    parsed = json.loads(cleaned[:last_brace + 1])
                 except Exception:
-                    parsed = None
+                    pass
 
         if not parsed:
             st.warning("Output not valid JSON. Showing raw output below.")
             st.code(result)
+
         else:
             tabs = st.tabs(["HPI", "Assessment & Plan", "Medication Review", "Source Summary"])
             keys = ["hpi", "assessment_plan", "medication_review", "source_summary"]
